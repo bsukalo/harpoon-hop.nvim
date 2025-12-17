@@ -17,6 +17,35 @@ M.config = {
 	},
 }
 
+-- returns git root for a directory, nil if not in a git repo
+local function get_git_root(dir)
+	local result =
+		vim.fn.systemlist("git -C " .. vim.fn.shellescape(dir) .. " rev-parse --show-toplevel 2>/dev/null")[1]
+	if vim.v.shell_error == 0 and result and result ~= "" then
+		return vim.loop.fs_realpath(result)
+	end
+	return nil
+end
+
+-- determines the "canonical" key for a directory
+-- returns git root if in a repo, base_dir if not
+local function get_canonical_key(dir)
+	dir = vim.loop.fs_realpath(dir) or dir
+	local base = vim.loop.fs_realpath(M.config.base_dir) or M.config.base_dir
+
+	if dir == base then
+		return base
+	end
+
+	local git_root = get_git_root(dir)
+	if git_root then
+		return git_root
+	end
+
+	-- fall back to base_dir
+	return base
+end
+
 local function find_harpoon_file_for_dir(target_dir)
 	local data_path = vim.fn.stdpath("data") .. "/harpoon"
 	local files = vim.fn.glob(data_path .. "/*.json", false, true)
@@ -34,29 +63,27 @@ end
 local function sync_to_base()
 	local harpoon = require("harpoon")
 	local cwd = vim.loop.cwd()
-	if cwd ~= M.config.base_dir then
-		local current_list = harpoon:list()
+	local base = vim.loop.fs_realpath(M.config.base_dir) or M.config.base_dir
 
+	if cwd ~= base then
+		local current_list = harpoon:list()
 		if current_list then
-			local current_key = harpoon.config.settings.key()
+			local current_key = get_canonical_key(cwd)
 			harpoon.data:sync(current_key, current_list.name, current_list)
 		end
 
-		local base_dir = cwd
+		local original_dir = cwd
 		vim.cmd[M.config.cd_command](M.config.base_dir)
-		local base_key = harpoon.config.settings.key()
-		local base_list = harpoon:list(base_key)
-
+		local base_list = harpoon:list()
 		if base_list then
-			harpoon.data:sync(base_key, base_list.name, base_list)
+			harpoon.data:sync(base, base_list.name, base_list)
 		end
-		vim.cmd[M.config.cd_command](base_dir)
-		harpoon:list(current_key)
+
+		vim.cmd[M.config.cd_command](original_dir)
 	else
 		local list = harpoon:list()
 		if list then
-			local key = harpoon.config.settings.key()
-			harpoon.data:sync(key, list.name, list)
+			harpoon.data:sync(base, list.name, list)
 		end
 	end
 end
@@ -65,11 +92,14 @@ local function hop_to_dir(target_dir)
 	local harpoon = require("harpoon")
 	sync_to_base()
 	vim.cmd[M.config.cd_command](target_dir)
-	local new_key = harpoon.config.settings.key()
+
+	local new_key = get_canonical_key(target_dir)
+
+	-- clear cached list to force reload
 	harpoon.lists[new_key] = nil
 
 	local ok, new_list = pcall(function()
-		return harpoon:list(new_key)
+		return harpoon:list()
 	end)
 
 	if not ok or not new_list or not new_list.items then
@@ -80,8 +110,9 @@ local function hop_to_dir(target_dir)
 			harpoon.data._data[new_key] = { __harpoon_files = {} }
 		end
 		harpoon.lists[new_key] = nil
-		harpoon:list(new_key)
+		harpoon:list()
 	end
+
 	print("hop → " .. vim.fn.fnamemodify(target_dir, ":t"))
 end
 
@@ -93,6 +124,36 @@ function M.setup(user_config)
 	M.config = vim.tbl_deep_extend("force", M.config, user_config or {})
 	local harpoon = require("harpoon")
 	local List = require("harpoon.list")
+
+	-- override harpoon's key function
+	harpoon:setup({
+		settings = {
+			key = function()
+				return get_canonical_key(vim.loop.cwd())
+			end,
+			save_on_toggle = true,
+			sync_on_ui_close = true,
+		},
+	})
+
+	-- on startup, if in a non-canonical directory, redirect to base
+	vim.schedule(function()
+		local cwd = vim.loop.cwd()
+		local canonical = get_canonical_key(cwd)
+		local real_cwd = vim.loop.fs_realpath(cwd) or cwd
+
+		-- if canonical key differs from actual cwd and not in a git repo,
+		-- preload base_dir data to prevent corruption
+		if canonical ~= real_cwd then
+			local base_data = harpoon.data._data[canonical]
+			if not base_data then
+				local harpoon_file, file_data = find_harpoon_file_for_dir(canonical)
+				if harpoon_file and file_data and file_data[canonical] then
+					harpoon.data._data[canonical] = file_data[canonical]
+				end
+			end
+		end
+	end)
 
 	vim.keymap.set("n", M.config.back_keymap, function()
 		hop_to_dir(M.config.base_dir)
@@ -121,16 +182,12 @@ function M.setup(user_config)
 		end
 
 		local dir = vim.fn.fnamemodify(file, ":h")
-		local root =
-			vim.fn.systemlist("git -C " .. vim.fn.shellescape(dir) .. " rev-parse --show-toplevel 2>/dev/null")[1]
+		local root = get_git_root(dir)
 
-		if vim.v.shell_error == 0 and root and root ~= "" then
-			root = vim.loop.fs_realpath(root)
-			if root ~= cwd then
-				hop_to_dir(root)
-				vim.cmd.edit(file)
-				return
-			end
+		if root and root ~= cwd then
+			hop_to_dir(root)
+			vim.cmd.edit(file)
+			return
 		end
 
 		vim.cmd.edit(file)
@@ -139,28 +196,17 @@ function M.setup(user_config)
 	vim.api.nvim_create_autocmd("VimLeavePre", {
 		callback = function()
 			sync_to_base()
-			local ok, _ = pcall(function()
+			pcall(function()
 				harpoon.data:write_all()
 			end)
-
-			if not ok then
-				local list = harpoon:list()
-				if list then
-					local key = harpoon.config.settings.key()
-					pcall(function()
-						harpoon.data:sync(key, list.name, list)
-					end)
-				end
-			end
 		end,
 	})
 
 	vim.api.nvim_create_autocmd("BufWritePost", {
 		callback = function()
 			local list = harpoon:list()
-
 			if list then
-				local key = harpoon.config.settings.key()
+				local key = get_canonical_key(vim.loop.cwd())
 				pcall(function()
 					harpoon.data:sync(key, list.name, list)
 				end)
