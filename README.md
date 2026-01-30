@@ -20,6 +20,7 @@ Harpoon-hop solves this by having a "base" directory (e.g., `~/projects`) as a m
     config = function()
         require("harpoon-hop").setup({
             -- your config goes here
+            -- or just leave this blank for defaults
         })
     end
 }
@@ -48,10 +49,10 @@ Within a project:
 ### Default Config
 ```lua
 require("harpoon-hop").setup({
-    cd_command = "tcd",           -- command to change directory (tcd, cd, lcd)
+    cd_command = "tcd",            -- command to change directory (tcd, cd, lcd)
     base_dir = vim.fn.expand("~"), -- your projects directory
-    back_keymap = "<C-b>",        -- keymap to hop back to base_dir
-    quick_switch_keymaps = {      -- keymaps for quick project switching
+    back_keymap = "<C-b>",         -- keymap to hop back to base_dir
+    quick_switch_keymaps = {       -- keymaps for quick project switching
         ["<leader>1"] = 1,
         ["<leader>2"] = 2,
         ["<leader>3"] = 3,
